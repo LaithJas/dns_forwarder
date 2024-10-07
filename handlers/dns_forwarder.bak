@@ -1,0 +1,293 @@
+package main
+
+import (
+	"encoding/binary"
+	"fmt"
+	"net"
+	"strconv"
+)
+
+// a struct that represent the header of a DNS message
+type header struct {
+	ID     uint16
+	QR     bool // one bit field that specifies weather it's a query(0) or response(1)
+	OPCODE uint8
+
+	AA bool // Authoritative answer
+	TC bool // TrunCation
+	RD bool // Recursion Desired
+	RA bool // Recursion Avilable
+	// bit 10 must be 0 in all Qs and Rs
+
+	RCODE uint8
+
+	flags   uint16
+	QDCOUNT uint16 // number of entires in the quesiton section
+	ANCOUNT uint16 // number of resource records in the answer section
+	NSCOUNT uint16 // number of name server resource records in the authority records section
+	ARCOUNT uint16 // number of resource records in the additional records section
+}
+
+type questionSection struct {
+	QNAME  string
+	QTYPE  uint16
+	QClASS uint16
+}
+
+type resourceRecord struct {
+	name     string
+	rData    []byte
+	ttl      uint32
+	rType    uint16
+	class    uint16
+	rDLength uint16
+}
+
+var rr_types = map[uint16]string{
+	1:   "A",
+	2:   "NS",
+	5:   "CNAME",
+	6:   "SOA",
+	12:  "PTR",
+	15:  "MX",
+	16:  "TXT",
+	28:  "AAAA",
+	33:  "SRV",
+	257: "CAA",
+	35:  "NAPTR",
+	43:  "DS",
+	48:  "DNSKEY",
+	52:  "TLSA",
+	255: "ANY",
+}
+
+var rr_classes = map[uint16]string{
+	1:   "IN",
+	2:   "CS",
+	3:   "CH",
+	4:   "HS",
+	255: "ANY",
+}
+
+// handle_request() is used by run a request agent that will forward the message t
+// DNS name server, process the response and resend it to the user who requested it.
+func handle_request(conn *net.UDPConn, client_addr *net.UDPAddr, dns_msg []byte) {
+	// forwarding the DNS request to a DNS name server
+	response, err := forward_DNS_Request(dns_msg, "8.8.8.8:53")
+	if err != nil {
+		fmt.Errorf("Failed to forward DNS request:  %v", err)
+		return
+	}
+
+	// parsing the response to save in cache
+	header_len := 12
+	response_header, _ := parseHeader(response)
+	q_section, offset, _ := parseQuestionSection(response[header_len:])
+	// total_rr := response_header.ANCOUNT + response_header.NSCOUNT + response_header.ARCOUNT
+	rr_section := parseResourceRecord(response, offset+header_len)
+
+	// printing for debugging and visusal presentation
+	printResponse(response_header, q_section)
+	fmt.Printf("Name:%s ,TTL:%d, TYPE:%s, Class:%s, RDLength:%d\n ",
+		rr_section.name, rr_section.ttl, rr_types[rr_section.rType], rr_classes[rr_section.class], rr_section.rDLength) // for Debugging only
+
+	// sending response back to user
+	_, err = conn.WriteToUDP(response, client_addr)
+	if err != nil {
+		fmt.Errorf("Writing to clinet failed!!")
+	}
+}
+
+// TODO: create a cache to rememebr quieries and serve them when needed
+// func main() {
+// 	// starting a server for open UDP connection
+// 	addr := &net.UDPAddr{
+// 		IP:   net.IPv4(0, 0, 0, 0),
+// 		Port: 1053,
+// 		Zone: "",
+// 	}
+// 	conn, err := net.ListenUDP("udp", addr)
+// 	if err != nil {
+// 		return
+// 	}
+// 	defer conn.Close()
+//
+// 	for {
+// 		buf := make([]byte, 1024)
+// 		n, client_addr, err := conn.ReadFromUDP(buf)
+// 		if err != nil {
+// 			fmt.Errorf("Error While Reading data")
+// 			continue
+// 		}
+// 		dns_msg := buf[:n]
+// 		go handle_request(conn, client_addr, dns_msg)
+// 	}
+// }
+
+// parseHeader parses the header of a DNS message requeset.
+// it takes a DNS request as an argument
+// it returns a header struct that contains all the necessary values
+// except the 'Z' which is reserved for future use according to RFC 1035 (must be zeros)
+// an error is also returned
+func parseHeader(dnsMsg []byte) (*header, error) {
+	if len(dnsMsg) < 12 {
+		return nil, fmt.Errorf("DNS Message is too short")
+	}
+
+	// creating a new instance of 'header' struct
+	msg := new(header)
+
+	msg.ID = binary.BigEndian.Uint16(dnsMsg[0:2])
+	msg.flags = binary.BigEndian.Uint16(dnsMsg[2:4])
+	// start parsing flags
+	flags := msg.flags
+	msg.QR = flags&0x8000 != 0
+	msg.OPCODE = uint8((flags >> 11) & 0x0F)
+	msg.AA = flags&0x0400 != 0
+	msg.TC = flags&0x0200 != 0
+	msg.RD = flags&0x0100 != 0
+	msg.RA = flags&0x0080 != 0
+	msg.RCODE = uint8(flags & 0x000F)
+	// End parsing flags
+
+	msg.QDCOUNT = binary.BigEndian.Uint16(dnsMsg[4:6])
+	msg.ANCOUNT = binary.BigEndian.Uint16(dnsMsg[6:8])
+	msg.NSCOUNT = binary.BigEndian.Uint16(dnsMsg[8:10])
+	msg.ARCOUNT = binary.BigEndian.Uint16(dnsMsg[10:12])
+
+	return msg, nil
+}
+
+// parseQuestionSection parses the question section of the DNS message.
+// it returns a struct with the domain name as a string and other values as uint16
+// TODO: maybe remove the returned error, or make it useful
+func parseQuestionSection(dnsMsg []byte) (*questionSection, int, error) {
+	msg := &questionSection{}
+	domain_name, n := parseDomainName(dnsMsg, 0)
+	msg.QNAME = domain_name
+	msg.QTYPE = binary.BigEndian.Uint16(dnsMsg[n : n+2])
+	msg.QClASS = binary.BigEndian.Uint16(dnsMsg[n+2 : n+4])
+
+	return msg, n + 4, nil
+}
+
+func parseResourceRecord(data []byte, offset int) *resourceRecord {
+	rr := &resourceRecord{}
+	var n int
+	dn_offset := get_pointer(data, offset)
+	if dn_offset == -1 {
+		rr.name, n = parseDomainName(data, offset)
+	} else {
+		rr.name, _ = parseDomainName(data, dn_offset)
+		n = offset + 2
+	}
+	rr.rType = binary.BigEndian.Uint16(data[n : n+2])
+	rr.class = binary.BigEndian.Uint16(data[n+2 : n+4])
+	rr.ttl = binary.BigEndian.Uint32(data[n+4 : n+8])
+	rr.rDLength = binary.BigEndian.Uint16(data[n+8 : n+10])
+	temp, _ := parseRData(data, n+10, int(rr.rDLength), rr.rType)
+	fmt.Printf("\nis this empty?%d %s\n", rr.rDLength, temp)
+
+	return rr
+}
+
+// returns the domain name given the DNS request message byte string
+// returns the name as a string, and the amount of bytes that were read
+func parseDomainName(dnsMsg []byte, offset int) (string, int) {
+	var qname string
+	var qnameLen int
+	// Loop through each label in QNAME
+	for {
+		length := int(dnsMsg[offset])
+		if length == 0 {
+			qnameLen++ // Add 1 for the null byte
+			break
+		}
+
+		offset++               // Move past the length byte
+		qnameLen += length + 1 // Add label length + 1 (for the length byte)
+		label := dnsMsg[offset : offset+length]
+		qname += string(label) + "."
+		offset += length
+	}
+
+	return qname, qnameLen
+}
+
+func get_pointer(data []byte, offset int) int {
+	ptr := strconv.FormatUint(uint64(int(data[offset])), 2)
+	if ptr[:2] == "11" {
+		ptr_val := strconv.FormatUint(uint64(int(data[offset+1])), 2)
+		ptr_val = ptr[2:] + ptr_val
+		new_offset, _ := strconv.ParseInt(ptr_val, 2, 64)
+		return int(new_offset)
+	}
+	return -1
+}
+
+func parseRData(data []byte, offset int, rdLength int, rrType uint16) (string, error) {
+	rdata := data[offset : offset+rdLength]
+
+	switch rrType {
+	case 1: // A record (IPv4 address)
+		if rdLength != 4 {
+			return "", fmt.Errorf("Invalid RDATA length for A record")
+		}
+		ip := net.IPv4(rdata[0], rdata[1], rdata[2], rdata[3])
+		return ip.String(), nil
+	case 28: // AAAA record (IPv6 address)
+		if rdLength != 16 {
+			return "", fmt.Errorf("Invalid RDATA length for AAAA record")
+		}
+		ip := net.IP(rdata)
+		return ip.String(), nil
+	case 15: // MX record (Mail Exchange)
+		// MX RDATA format: 2-byte preference followed by domain name
+		preference := binary.BigEndian.Uint16(rdata[:2])
+		mxName, _ := parseDomainName(rdata[2:], 0) // Parse domain name starting at byte 2
+		return fmt.Sprintf("Preference: %d, Exchange: %s", preference, mxName), nil
+	// Add other cases for different types like NS, CNAME, etc.
+	default:
+		// For unknown types, just return the raw RDATA as a hex string
+		return fmt.Sprintf("%x", rdata), nil
+	}
+}
+
+// forward_DNS_Request forwards the received DNS request to a given address server address
+// it returns the response from the server.
+func forward_DNS_Request(request []byte, server_addr string) ([]byte, error) {
+	addr, err := net.ResolveUDPAddr("udp", server_addr)
+	if err != nil {
+		return nil, err
+	}
+
+	conn, err := net.DialUDP("udp", nil, addr)
+	if err != nil {
+		return nil, err
+	}
+
+	// TODO: I can set a TTL using conn.SetDeadline(time.Now().Add(5*time.Second))
+
+	// Send the DNS request
+	_, err = conn.Write(request)
+	if err != nil {
+		return nil, err
+	}
+
+	buffer := make([]byte, 512)
+
+	n, _, err := conn.ReadFromUDP(buffer)
+	if err != nil {
+		return nil, err
+	}
+
+	return buffer[:n], nil
+}
+
+// Print Response requests the response from the query as a strings
+// h == header, qs == questionSection
+func printResponse(h *header, qs *questionSection) {
+	fmt.Printf("Header- ID:%d flags:%d questions:%d answers:%d authorities:%d additionals:%d\n",
+		h.ID, h.flags, h.QDCOUNT, h.ANCOUNT, h.NSCOUNT, h.ARCOUNT)
+	fmt.Printf("Question- name:%s type:%s class:%s\n", qs.QNAME, rr_types[qs.QTYPE], rr_classes[qs.QClASS])
+}
